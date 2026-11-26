@@ -60,7 +60,6 @@ class GPT(nn.Module):
         self, gpt_folder: str, embed_file_path: str, experimental=False
     ):
         if self.is_vllm and platform.system().lower() == "linux":
-
             from .velocity import LLM
 
             self.llm = LLM(
@@ -114,7 +113,6 @@ class GPT(nn.Module):
         self,
         config: dict,
     ) -> Tuple[LlamaModel, LlamaConfig]:
-
         if self.use_flash_attn and is_flash_attn_2_available():
             llama_config = LlamaConfig(
                 **config,
@@ -203,6 +201,26 @@ class GPT(nn.Module):
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
 
+            # Defensive sanitization: ensure numeric lengths are non-negative ints or None
+            try:
+                past_length = int(past_length)
+            except Exception:
+                past_length = 0
+            if past_length < 0:
+                past_length = 0
+            if max_cache_length is not None:
+                try:
+                    max_cache_length = int(max_cache_length)
+                except Exception:
+                    max_cache_length = None
+                if max_cache_length is not None and max_cache_length < 0:
+                    max_cache_length = None
+            try:
+                cache_length = int(cache_length)
+            except Exception:
+                cache_length = 0
+            cache_length = max(0, cache_length)
+
             # Keep only the unprocessed tokens:
             # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
             # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
@@ -211,14 +229,22 @@ class GPT(nn.Module):
                 attention_mask is not None
                 and attention_mask.shape[1] > input_ids.shape[1]
             ):
+                # compute how many tokens we want to keep from the end of input_ids
                 start = attention_mask.shape[1] - past_length
-                input_ids = input_ids.narrow(1, -start, start)
+                # clamp start to valid range [0, input_ids.shape[1]]
+                start = int(max(0, min(start, input_ids.shape[1])))
+                if start > 0:
+                    start_idx = input_ids.shape[1] - start
+                    input_ids = input_ids.narrow(1, start_idx, start)
+                # else: nothing to narrow, keep input_ids as-is
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
             elif past_length < input_ids.shape[1]:
-                input_ids = input_ids.narrow(
-                    1, past_length, input_ids.size(1) - past_length
-                )
+                # ensure past_length is within valid range
+                start_idx = int(max(0, min(past_length, input_ids.shape[1])))
+                length = input_ids.size(1) - start_idx
+                if length > 0:
+                    input_ids = input_ids.narrow(1, start_idx, length)
             # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
 
             # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
@@ -227,18 +253,25 @@ class GPT(nn.Module):
                 and attention_mask is not None
                 and cache_length + input_ids.shape[1] > max_cache_length
             ):
-                attention_mask = attention_mask.narrow(
-                    1, -max_cache_length, max_cache_length
-                )
+                # clamp max_cache_length to a valid positive length and take the last `length` elements
+                length = int(max_cache_length)
+                if length > 0:
+                    length = min(length, attention_mask.shape[1])
+                    start_idx = attention_mask.shape[1] - length
+                    attention_mask = attention_mask.narrow(1, start_idx, length)
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask.eq(0), 1)
             if past_key_values:
-                position_ids = position_ids.narrow(
-                    1, -input_ids.shape[1], input_ids.shape[1]
-                )
+                # select the last `input_ids.shape[1]` positions from position_ids in a safe way
+                desired_len = int(input_ids.shape[1])
+                total_len = position_ids.shape[1]
+                length = min(desired_len, total_len)
+                if length > 0:
+                    start_idx = total_len - length
+                    position_ids = position_ids.narrow(1, start_idx, length)
 
         input_length = (
             position_ids.shape[-1] if position_ids is not None else input_ids.shape[-1]
@@ -248,7 +281,22 @@ class GPT(nn.Module):
                 past_length, past_length + input_length, device=input_ids.device
             )
         else:
-            cache_position = cache_position.narrow(0, -input_length, input_length)
+            # safely narrow cache_position to the last `input_length` elements
+            try:
+                total_cache_len = cache_position.shape[0]
+                desired = int(input_length)
+                length = min(max(0, desired), total_cache_len)
+                if length > 0:
+                    start_idx = total_cache_len - length
+                    cache_position = cache_position.narrow(0, start_idx, length)
+                else:
+                    # if nothing to select, create an empty tensor with correct device
+                    cache_position = cache_position.new_empty((0,))
+            except Exception:
+                # fallback: create a new range matching desired length
+                cache_position = torch.arange(
+                    past_length, past_length + input_length, device=input_ids.device
+                )
 
         if has_static_cache:
             past_key_values = None
@@ -335,13 +383,15 @@ class GPT(nn.Module):
         manual_seed: Optional[int] = None,
         context=Context(),
     ):
-
         attentions: List[Optional[Tuple[torch.FloatTensor, ...]]] = []
         hiddens = []
         stream_iter = 0
 
-        start_idx, end_idx = inputs_ids.shape[1], torch.zeros(
-            inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long
+        start_idx, end_idx = (
+            inputs_ids.shape[1],
+            torch.zeros(
+                inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long
+            ),
         )
         finish = torch.zeros(inputs_ids.shape[0], device=inputs_ids.device).bool()
 
@@ -392,7 +442,6 @@ class GPT(nn.Module):
         past_key_values = None
 
         for i in range(max_new_token):
-
             model_input = self._prepare_generation_inputs(
                 inputs_ids,
                 past_key_values,

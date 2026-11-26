@@ -105,7 +105,7 @@ class Chat:
             if download_path is None or force_redownload:
                 self.logger.log(
                     logging.INFO,
-                    f"download from HF: https://huggingface.co/2Noise/ChatTTS",
+                    "download from HF: https://huggingface.co/2Noise/ChatTTS",
                 )
                 try:
                     download_path = snapshot_download(
@@ -305,9 +305,7 @@ class Chat:
                 # Vocos on mps will crash, use cpu fallback.
                 # Plus, complex dtype used in the decode process of Vocos is not supported in torch_npu now,
                 # so we put this calculation of data on CPU instead of NPU.
-                "cpu"
-                if "mps" in str(device) or "npu" in str(device)
-                else device
+                "cpu" if "mps" in str(device) or "npu" in str(device) else device
             )
             .eval()
         )
@@ -397,7 +395,6 @@ class Chat:
         params_refine_text=RefineTextParams(),
         params_infer_code=InferCodeParams(),
     ):
-
         assert self.has_loaded(use_decoder=use_decoder)
 
         if not isinstance(text, list):
@@ -517,7 +514,8 @@ class Chat:
         decoder = self.decoder if use_decoder else self.dvae
         max_x_len = -1
         if len(result_list) == 0:
-            return np.array([], dtype=np.float32)
+            # return an empty 2-D array to satisfy downstream shape expectations
+            return np.zeros((0, 0), dtype=np.float32)
         for result in result_list:
             if result.size(0) > max_x_len:
                 max_x_len = result.size(0)
@@ -528,7 +526,9 @@ class Chat:
         )
         for i in range(len(result_list)):
             src = result_list[i]
-            batch_result[i].narrow(1, 0, src.size(0)).copy_(src.permute(1, 0))
+            # src: (time, channels). src.permute(1, 0) -> (channels, time).
+            # Assign explicitly into batch_result to avoid dimension-indexing errors.
+            batch_result[i, :, : src.size(0)].copy_(src.permute(1, 0))
             del src
         del_all(result_list)
         mel_specs = decoder(batch_result)
@@ -546,7 +546,6 @@ class Chat:
         return_hidden: bool,
         params: InferCodeParams,
     ):
-
         gpt = self.gpt
 
         if not isinstance(text, list):
@@ -574,7 +573,36 @@ class Chat:
             ),
             device=self.device_gpt,
         )
-        start_idx = input_ids.shape[-2]
+
+        # Robustly compute start_idx and validate shapes to avoid negative/invalid
+        # lengths being passed into downstream narrow() operations.
+        start_idx = 0
+        try:
+            if hasattr(input_ids, "shape"):
+                # Prefer the second-last dimension if present, otherwise fall back
+                # to first dimension. Ensure result is a non-negative int.
+                if len(input_ids.shape) >= 2:
+                    candidate = int(input_ids.shape[-2])
+                else:
+                    candidate = int(input_ids.shape[0])
+                if candidate >= 0:
+                    start_idx = candidate
+            else:
+                # If input_ids is a list of lists (or similar), derive length from first element
+                first = input_ids[0]
+                if isinstance(first, (list, tuple)):
+                    start_idx = len(first)
+                elif hasattr(first, "shape"):
+                    # e.g., a tensor inside a list
+                    if len(first.shape) >= 1:
+                        start_idx = int(first.shape[0])
+        except Exception:
+            # On any unexpected shape, default to 0 to avoid negative narrow lengths
+            start_idx = 0
+
+        # Final safety clamp
+        if not isinstance(start_idx, int) or start_idx < 0:
+            start_idx = 0
 
         num_code = self.config.gpt.num_audio_tokens - 1
 
@@ -667,7 +695,6 @@ class Chat:
         device: torch.device,
         params: RefineTextParams,
     ):
-
         gpt = self.gpt
 
         if not isinstance(text, list):
