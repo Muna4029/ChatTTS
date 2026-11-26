@@ -60,7 +60,6 @@ class GPT(nn.Module):
         self, gpt_folder: str, embed_file_path: str, experimental=False
     ):
         if self.is_vllm and platform.system().lower() == "linux":
-
             from .velocity import LLM
 
             self.llm = LLM(
@@ -114,7 +113,6 @@ class GPT(nn.Module):
         self,
         config: dict,
     ) -> Tuple[LlamaModel, LlamaConfig]:
-
         if self.use_flash_attn and is_flash_attn_2_available():
             llama_config = LlamaConfig(
                 **config,
@@ -211,8 +209,14 @@ class GPT(nn.Module):
                 attention_mask is not None
                 and attention_mask.shape[1] > input_ids.shape[1]
             ):
+                # number of tokens that belong to the cache-side inputs
                 start = attention_mask.shape[1] - past_length
-                input_ids = input_ids.narrow(1, -start, start)
+                # We want to take the last `start` tokens from input_ids, but ensure indices/lengths are valid
+                if start > 0:
+                    take = min(start, input_ids.shape[1])
+                    start_idx = max(input_ids.shape[1] - take, 0)
+                    if take > 0:
+                        input_ids = input_ids.narrow(1, start_idx, take)
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
             elif past_length < input_ids.shape[1]:
@@ -227,18 +231,27 @@ class GPT(nn.Module):
                 and attention_mask is not None
                 and cache_length + input_ids.shape[1] > max_cache_length
             ):
-                attention_mask = attention_mask.narrow(
-                    1, -max_cache_length, max_cache_length
+                # ensure positive and valid slicing parameters
+                take = (
+                    min(max_cache_length, attention_mask.shape[1])
+                    if max_cache_length is not None
+                    else attention_mask.shape[1]
                 )
+                if take > 0:
+                    start_idx = max(attention_mask.shape[1] - take, 0)
+                    attention_mask = attention_mask.narrow(1, start_idx, take)
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask.eq(0), 1)
             if past_key_values:
-                position_ids = position_ids.narrow(
-                    1, -input_ids.shape[1], input_ids.shape[1]
-                )
+                # take only the last `input_ids.shape[1]` positions but ensure bounds
+                total_pos = position_ids.shape[1]
+                take = min(input_ids.shape[1], total_pos)
+                if take > 0:
+                    start_idx = max(total_pos - take, 0)
+                    position_ids = position_ids.narrow(1, start_idx, take)
 
         input_length = (
             position_ids.shape[-1] if position_ids is not None else input_ids.shape[-1]
@@ -248,7 +261,17 @@ class GPT(nn.Module):
                 past_length, past_length + input_length, device=input_ids.device
             )
         else:
-            cache_position = cache_position.narrow(0, -input_length, input_length)
+            # ensure valid slicing of cache_position
+            total_cache = cache_position.shape[0]
+            take = min(input_length, total_cache)
+            if take > 0:
+                start_idx = max(total_cache - take, 0)
+                cache_position = cache_position.narrow(0, start_idx, take)
+            else:
+                # empty selection
+                cache_position = cache_position.new_empty(
+                    (0,), dtype=cache_position.dtype, device=cache_position.device
+                )
 
         if has_static_cache:
             past_key_values = None
@@ -335,13 +358,15 @@ class GPT(nn.Module):
         manual_seed: Optional[int] = None,
         context=Context(),
     ):
-
         attentions: List[Optional[Tuple[torch.FloatTensor, ...]]] = []
         hiddens = []
         stream_iter = 0
 
-        start_idx, end_idx = inputs_ids.shape[1], torch.zeros(
-            inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long
+        start_idx, end_idx = (
+            inputs_ids.shape[1],
+            torch.zeros(
+                inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long
+            ),
         )
         finish = torch.zeros(inputs_ids.shape[0], device=inputs_ids.device).bool()
 
@@ -392,7 +417,6 @@ class GPT(nn.Module):
         past_key_values = None
 
         for i in range(max_new_token):
-
             model_input = self._prepare_generation_inputs(
                 inputs_ids,
                 past_key_values,

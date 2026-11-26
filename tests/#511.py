@@ -1,4 +1,5 @@
-import os, sys
+import os
+import sys
 
 if sys.platform == "darwin":
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -38,12 +39,17 @@ params_infer_code = ChatTTS.Chat.InferCodeParams(
 
 fail = False
 
-wavs = chat.infer(
-    texts,
-    skip_refine_text=True,
-    split_text=False,
-    params_infer_code=params_infer_code,
-)
+try:
+    wavs = chat.infer(
+        texts,
+        skip_refine_text=True,
+        split_text=False,
+        params_infer_code=params_infer_code,
+    )
+except Exception as exc:
+    logger.error("chat.infer failed: %s", exc)
+    # Fallback to a list of None so downstream checks can detect failure and exit gracefully
+    wavs = [None for _ in texts]
 
 for k, wav in enumerate(wavs):
     if wav is None:
